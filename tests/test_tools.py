@@ -1,4 +1,6 @@
 
+"""Tests for repository inspection tools and secret redaction."""
+
 import subprocess
 
 import pytest
@@ -8,6 +10,7 @@ from tools import (
     git_log,
     list_files,
     read_file,
+    redact_content,
     search_code,
 )
 
@@ -29,7 +32,10 @@ def repo(tmp_path):
         encoding="utf-8",
     )
 
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "init", "-q", str(tmp_path)],
+        check=True,
+    )
     subprocess.run(
         ["git", "-C", str(tmp_path), "add", "app.py", "README.md"],
         check=True,
@@ -52,7 +58,9 @@ def test_list_files_excludes_virtual_environment(repo):
 
     assert "app.py" in result["files"]
     assert "README.md" in result["files"]
-    assert not any(path.startswith(".venv/") for path in result["files"])
+    assert not any(
+        path.startswith(".venv/") for path in result["files"]
+    )
 
 
 def test_read_file_includes_line_numbers(repo):
@@ -87,14 +95,55 @@ def test_read_file_redacts_secret_values(repo):
     secret_file = repo / "config.env"
     secret_file.write_text(
         'API_KEY="sensitive-example-value"\n'
-        'password=another-sensitive-value\n',
+        "password=another-sensitive-value\n",
         encoding="utf-8",
     )
 
     result = read_file(repo, "config.env")
+    content = result["content"]
 
-    assert "sensitive-example-value" not in result["content"]
-    assert "another-sensitive-value" not in result["content"]
-    assert "[REDACTED]" in result["content"]
-    assert "1:" in result["content"]
-    assert "2:" in result["content"]
+    assert "sensitive-example-value" not in content
+    assert "another-sensitive-value" not in content
+    assert "[REDACTED]" in content
+    assert "1:" in content
+    assert "2:" in content
+
+
+def test_redact_aws_credentials():
+    content = (
+        "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n"
+        "AWS_SECRET_ACCESS_KEY=example-secret-value\n"
+        "Authorization: Bearer example-bearer-token\n"
+    )
+
+    result = redact_content(content)
+
+    assert "AKIAIOSFODNN7EXAMPLE" not in result
+    assert "example-secret-value" not in result
+    assert "example-bearer-token" not in result
+    assert "[REDACTED]" in result
+
+
+def test_redact_quoted_credentials():
+    content = (
+        'client_secret = "quoted-secret-example"\n'
+        "password: 'quoted-password-example'\n"
+    )
+
+    result = redact_content(content)
+
+    assert "quoted-secret-example" not in result
+    assert "quoted-password-example" not in result
+
+
+def test_redact_private_key_body():
+    content = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "private-key-body-example\n"
+        "-----END PRIVATE KEY-----\n"
+    )
+
+    result = redact_content(content)
+
+    assert "private-key-body-example" not in result
+    assert "[REDACTED PRIVATE KEY]" in result

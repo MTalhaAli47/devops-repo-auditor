@@ -1,9 +1,12 @@
+
 """CLI entry point for the DevOps repository auditor."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -12,10 +15,49 @@ from urllib.parse import urlparse
 
 from llm_client import GeminiClient, LLMError
 from prompts import build_audit_prompt
-from tools import ToolError, git_log, list_files, read_file, search_code
+from tools import (
+    ToolError,
+    git_log,
+    list_files,
+    read_file,
+    redact_content,
+    search_code,
+)
 
-#MAX_REPO_SIZE_MB = 500
 CLONE_TIMEOUT_SECONDS = 120
+
+REPORT_FIELDS = (
+    "rule_id",
+    "category",
+    "severity",
+    "file",
+    "line",
+    "description",
+    "evidence",
+    "recommendation",
+)
+TEXT_FIELDS = (
+    "rule_id",
+    "category",
+    "description",
+    "evidence",
+    "recommendation",
+)
+VALID_SEVERITIES = {"critical", "high", "medium", "low"}
+
+# Additional patterns for common credential formats. These are applied
+# to final finding text as defense in depth; they cannot identify every
+# possible secret format.
+EXTRA_SECRET_PATTERNS = (
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bASIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(
+        r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}"
+    ),
+)
+
 
 TOOL_SCHEMAS = [
     {
@@ -91,14 +133,21 @@ TOOL_SCHEMAS = [
 
 def validate_github_url(url: str) -> str:
     """Accept public GitHub HTTPS repository URLs only."""
-    parsed = urlparse(url)
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("Provide a public GitHub HTTPS repository URL.")
+
+    try:
+        parsed = urlparse(url.strip())
+        port = parsed.port
+    except ValueError:
+        raise ValueError("Invalid GitHub repository URL.") from None
 
     if (
         parsed.scheme != "https"
         or parsed.hostname != "github.com"
         or parsed.username
         or parsed.password
-        or parsed.port
+        or port is not None
         or parsed.query
         or parsed.fragment
     ):
@@ -115,17 +164,17 @@ def validate_github_url(url: str) -> str:
         )
 
     owner, repository = parts
+    repository = repository.removesuffix(".git")
+
+    # Reject malformed path components instead of silently normalizing them.
+    component_pattern = re.compile(r"^[A-Za-z0-9_.-]+$")
     if (
-        owner in {".", ".."}
+        not component_pattern.fullmatch(owner)
+        or not component_pattern.fullmatch(repository)
+        or owner in {".", ".."}
         or repository in {".", ".."}
-        or not owner
-        or not repository
     ):
         raise ValueError("Invalid GitHub repository path.")
-
-    repository = repository.removesuffix(".git")
-    if not repository:
-        raise ValueError("Invalid GitHub repository name.")
 
     return f"https://github.com/{owner}/{repository}.git"
 
@@ -154,7 +203,7 @@ def clone_repository(url: str, destination: Path) -> None:
             timeout=CLONE_TIMEOUT_SECONDS,
             check=False,
             env={
-                **__import__("os").environ,
+                **os.environ,
                 "GIT_TERMINAL_PROMPT": "0",
                 "GIT_LFS_SKIP_SMUDGE": "1",
             },
@@ -167,18 +216,28 @@ def clone_repository(url: str, destination: Path) -> None:
         ) from None
 
     if result.returncode != 0:
-        # Avoid printing raw Git output, which may contain private URLs or data.
+        # Do not print raw Git output, which could disclose sensitive data.
         raise RuntimeError(
             "Git could not clone this repository. Check the URL, "
             "network connection, and public repository access."
         )
 
 
+def _sanitize_finding_text(value: str) -> str:
+    """Redact likely secrets before a finding is written to the report."""
+    sanitized = redact_content(value)
+
+    for pattern in EXTRA_SECRET_PATTERNS:
+        sanitized = pattern.sub("[REDACTED]", sanitized)
+
+    return sanitized.strip()
+
+
 def validate_report(raw_response: str, repository_url: str) -> dict:
-    """Parse and validate the required JSON report structure."""
+    """Parse, sanitize and validate the required JSON report structure."""
     try:
         report = json.loads(raw_response)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         raise ValueError("The model did not return valid JSON.") from None
 
     if not isinstance(report, dict):
@@ -189,17 +248,7 @@ def validate_report(raw_response: str, repository_url: str) -> dict:
         raise ValueError("'violations' must be a JSON array.")
 
     clean_violations = []
-    required_fields = {
-        "rule_id",
-        "category",
-        "severity",
-        "file",
-        "line",
-        "description",
-        "evidence",
-        "recommendation",
-    }
-    valid_severities = {"critical", "high", "medium", "low"}
+    required_fields = set(REPORT_FIELDS)
 
     for index, violation in enumerate(violations):
         if not isinstance(violation, dict):
@@ -211,45 +260,71 @@ def validate_report(raw_response: str, repository_url: str) -> dict:
                 f"Violation {index} is missing required fields."
             )
 
-        if violation["severity"] not in valid_severities:
+        severity = violation["severity"]
+        if (
+            not isinstance(severity, str)
+            or severity not in VALID_SEVERITIES
+        ):
             raise ValueError(
                 f"Violation {index} has an invalid severity."
             )
 
-        for field in (
-            "rule_id",
-            "category",
-            "description",
-            "evidence",
-            "recommendation",
-        ):
-            if not isinstance(violation[field], str) or not violation[field].strip():
+        sanitized_fields = {}
+        for field in TEXT_FIELDS:
+            value = violation[field]
+            if not isinstance(value, str) or not value.strip():
                 raise ValueError(
                     f"Violation {index} has an invalid '{field}' value."
                 )
 
-        if violation["file"] is not None and not isinstance(
-            violation["file"], str
-        ):
-            raise ValueError(f"Violation {index} has an invalid file value.")
+            sanitized = _sanitize_finding_text(value)
+            if not sanitized:
+                raise ValueError(
+                    f"Violation {index} has an empty '{field}' after sanitization."
+                )
+            sanitized_fields[field] = sanitized
+
+        file_value = violation["file"]
+        if file_value is not None:
+            if not isinstance(file_value, str) or not file_value.strip():
+                raise ValueError(
+                    f"Violation {index} has an invalid file value."
+                )
+
+            # Paths must be repository-relative, not absolute or traversal paths.
+            normalized = file_value.replace("\\", "/")
+            path_parts = normalized.split("/")
+            if (
+                normalized.startswith("/")
+                or re.match(r"^[A-Za-z]:", normalized)
+                or any(part == ".." for part in path_parts)
+            ):
+                raise ValueError(
+                    f"Violation {index} has an invalid repository-relative path."
+                )
+            file_value = normalized
 
         line = violation["line"]
         if line is not None and (
-            not isinstance(line, int) or isinstance(line, bool) or line < 1
+            not isinstance(line, int)
+            or isinstance(line, bool)
+            or line < 1
         ):
-            raise ValueError(f"Violation {index} has an invalid line number.")
+            raise ValueError(
+                f"Violation {index} has an invalid line number."
+            )
 
         clean_violations.append(
-            {field: violation[field] for field in (
-                "rule_id",
-                "category",
-                "severity",
-                "file",
-                "line",
-                "description",
-                "evidence",
-                "recommendation",
-            )}
+            {
+                "rule_id": sanitized_fields["rule_id"],
+                "category": sanitized_fields["category"],
+                "severity": severity,
+                "file": file_value,
+                "line": line,
+                "description": sanitized_fields["description"],
+                "evidence": sanitized_fields["evidence"],
+                "recommendation": sanitized_fields["recommendation"],
+            }
         )
 
     return {
@@ -276,18 +351,15 @@ def audit_repository(repository_url: str) -> dict:
         }
 
         client = GeminiClient()
-        prompt = build_audit_prompt(repository_url)
+        prompt = build_audit_prompt(safe_url)
 
-        try:
-            raw_response = client.run_with_tools(
-                prompt=prompt,
-                tool_schemas=TOOL_SCHEMAS,
-                tool_handlers=handlers,
-            )
-        except (LLMError, ToolError):
-            raise
+        raw_response = client.run_with_tools(
+            prompt=prompt,
+            tool_schemas=TOOL_SCHEMAS,
+            tool_handlers=handlers,
+        )
 
-        return validate_report(raw_response, repository_url)
+        return validate_report(raw_response, safe_url)
 
 
 def main() -> int:

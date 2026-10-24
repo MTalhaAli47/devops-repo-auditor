@@ -1,4 +1,75 @@
 {
-  "repository": "https://github.com/MTalhaAli47/devops-repo-auditor",
-  "violations": []
+  "repository": "https://github.com/heamnathbaskar/awstraining-vulnerable-app.git",
+  "violations": [
+    {
+      "rule_id": "container_env_secrets",
+      "category": "Exposed secrets and unsafe deployment permissions",
+      "severity": "critical",
+      "file": "Dockerfile",
+      "line": 5,
+      "description": "AWS credentials hardcoded as environment variables in the Dockerfile.",
+      "evidence": "ENV AWS_ACCESS_KEY_ID=[REDACTED]",
+      "recommendation": "Remove hardcoded credentials from the Dockerfile and use IAM roles for tasks or secure secret management services (e.g., AWS Secrets Manager, Parameter Store)."
+    },
+    {
+      "rule_id": "s3_public_read_acl",
+      "category": "Infrastructure-as-code and deployment manifests",
+      "severity": "high",
+      "file": "cloudformation/template.yaml",
+      "line": 10,
+      "description": "S3 bucket configured with PublicRead access control.",
+      "evidence": "AccessControl: PublicRead",
+      "recommendation": "Change the bucket AccessControl to Private and use bucket policies or Origin Access Control (OAC) if public access is required for a CloudFront distribution."
+    },
+    {
+      "rule_id": "s3_public_read_acl_terraform",
+      "category": "Infrastructure-as-code and deployment manifests",
+      "severity": "high",
+      "file": "terraform/main.tf",
+      "line": 17,
+      "description": "S3 bucket configured with public-read ACL.",
+      "evidence": "acl    = \"public-read\"",
+      "recommendation": "Set the ACL to 'private' and manage permissions via IAM policies or Bucket Policies instead."
+    },
+    {
+      "rule_id": "iam_wildcard_permission",
+      "category": "Exposed secrets and unsafe deployment permissions",
+      "severity": "high",
+      "file": "cloudformation/template.yaml",
+      "line": 74,
+      "description": "IAM role policy grants administrative access by using wildcards for both Action and Resource.",
+      "evidence": "Action: '*'\nResource: '*'",
+      "recommendation": "Restrict the IAM policy to follow the principle of least privilege by specifying only the required actions and resources."
+    },
+    {
+      "rule_id": "iam_wildcard_permission_terraform",
+      "category": "Exposed secrets and unsafe deployment permissions",
+      "severity": "high",
+      "file": "terraform/main.tf",
+      "line": 30,
+      "description": "IAM policy grants administrative access by using wildcards for both Action and Resource.",
+      "evidence": "\"Action\": \"*\"\n\"Resource\": \"*\"",
+      "recommendation": "Specify explicit actions and resources to adhere to the principle of least privilege."
+    },
+    {
+      "rule_id": "security_group_ssh_public",
+      "category": "Network and permission security",
+      "severity": "high",
+      "file": "cloudformation/template.yaml",
+      "line": 85,
+      "description": "Security group rule allows unrestricted SSH access (port 22) from the public internet.",
+      "evidence": "CidrIp: 0.0.0.0/0",
+      "recommendation": "Restrict the CIDR range to a specific trusted IP range or use AWS Systems Manager Session Manager instead of SSH."
+    },
+    {
+      "rule_id": "security_group_all_open",
+      "category": "Network and permission security",
+      "severity": "critical",
+      "file": "terraform/main.tf",
+      "line": 46,
+      "description": "Security group rule allows all protocols and all ports from the public internet.",
+      "evidence": "cidr_blocks = [\"0.0.0.0/0\"]",
+      "recommendation": "Change the security group ingress rule to permit only the specific ports and protocols required by the application and restrict the CIDR range."
+    }
+  ]
 }

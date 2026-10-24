@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -14,24 +15,44 @@ MAX_MATCHES = 100
 MAX_LOG_ENTRIES = 30
 
 
-
 SECRET_ASSIGNMENT_RE = re.compile(
     r"""(?ix)
-    (\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|token|
-    secret|password|passwd|client[_-]?secret|private[_-]?key)\b
-    \s*[:=]\s*)
+    (
+        \b(?:
+            aws_secret_access_key |
+            secret_access_key |
+            aws_access_key_id |
+            access_key_id |
+            api[_-]?key |
+            access[_-]?token |
+            auth[_-]?token |
+            client[_-]?secret |
+            private[_-]?key |
+            password |
+            passwd |
+            secret |
+            token |
+            bearer |
+            authorization |
+            credential |
+            credentials
+        )\b
+        \s*[:=]\s*
+    )
     (?:
         "([^"]*)" |
         '([^']*)' |
-        ([^\s,;#]+)
+        (Bearer\s+)?([^\s,;#]+)
     )
     """
 )
 
 TOKEN_PATTERNS = [
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bASIA[0-9A-Z]{16}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}"),
 ]
 
 
@@ -55,11 +76,15 @@ def redact_content(content: str) -> str:
                 redacted.append("[REDACTED PRIVATE KEY]")
             continue
 
+        # Handle Authorization: Bearer <token> before generic assignments.
+        line = re.sub(
+            r"(?i)(\bauthorization\s*[:=]\s*)Bearer\s+[^\s,;#]+",
+            r"\1[REDACTED]",
+            line,
+        )
+
         line = SECRET_ASSIGNMENT_RE.sub(
-            lambda match: (
-                match.group(1)
-                + '"[REDACTED]"'
-            ),
+            lambda match: match.group(1) + "[REDACTED]",
             line,
         )
 
@@ -69,13 +94,6 @@ def redact_content(content: str) -> str:
         redacted.append(line)
 
     return "\n".join(redacted)
-
-
-
-
-
-
-
 
 
 IGNORED_DIRS = {
@@ -101,7 +119,7 @@ def _repo_root(repo_path: str | Path) -> Path:
     root = Path(repo_path).resolve()
 
     if not root.is_dir():
-        raise ToolError(f"Repository directory does not exist: {root}")
+        raise ToolError("Repository directory does not exist.")
 
     return root
 
@@ -126,6 +144,26 @@ def _safe_file(root: Path, relative_path: str) -> Path:
     return resolved
 
 
+def _safe_directory(root: Path, relative_path: str) -> Path:
+    """Resolve a directory contained inside the repository."""
+    candidate = Path(relative_path)
+
+    if candidate.is_absolute():
+        raise ToolError("Absolute paths are not allowed.")
+
+    resolved = (root / candidate).resolve()
+
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        raise ToolError("Path escapes the repository root.") from None
+
+    if not resolved.is_dir():
+        raise ToolError(f"Not a directory: {relative_path}")
+
+    return resolved
+
+
 def list_files(
     repo_path: str | Path,
     subdirectory: str = ".",
@@ -133,8 +171,10 @@ def list_files(
 ) -> dict:
     """List repository files without entering ignored directories."""
     root = _repo_root(repo_path)
-    start = root if subdirectory == "." else _safe_directory(
-        root, subdirectory
+    start = (
+        root
+        if subdirectory == "."
+        else _safe_directory(root, subdirectory)
     )
 
     if not 1 <= limit <= MAX_FILES:
@@ -143,14 +183,12 @@ def list_files(
     files = []
     truncated = False
 
-    for current, dirs, filenames in __import__("os").walk(
-        start, followlinks=False
-    ):
+    for current, dirs, filenames in os.walk(start, followlinks=False):
         current_path = Path(current)
 
-        # Ignore hidden Git metadata, virtual environments and caches.
         dirs[:] = sorted(
-            name for name in dirs
+            name
+            for name in dirs
             if name not in IGNORED_DIRS
             and not (current_path / name).is_symlink()
         )
@@ -177,26 +215,6 @@ def list_files(
     }
 
 
-def _safe_directory(root: Path, relative_path: str) -> Path:
-    """Resolve a directory contained inside the repository."""
-    candidate = Path(relative_path)
-
-    if candidate.is_absolute():
-        raise ToolError("Absolute paths are not allowed.")
-
-    resolved = (root / candidate).resolve()
-
-    try:
-        resolved.relative_to(root)
-    except ValueError:
-        raise ToolError("Path escapes the repository root.") from None
-
-    if not resolved.is_dir():
-        raise ToolError(f"Not a directory: {relative_path}")
-
-    return resolved
-
-
 def read_file(
     repo_path: str | Path,
     path: str,
@@ -216,7 +234,9 @@ def read_file(
     except UnicodeDecodeError:
         raise ToolError("File is not valid UTF-8 text.") from None
     except OSError as exc:
-        raise ToolError(f"Could not read file: {exc}") from None
+        raise ToolError(
+            f"Could not read file ({type(exc).__name__})."
+        ) from None
 
     numbered = [
         f"{number}: {line}"
@@ -246,8 +266,8 @@ def search_code(
 
     try:
         expression = re.compile(pattern, re.IGNORECASE)
-    except re.error as exc:
-        raise ToolError(f"Invalid regular expression: {exc}") from None
+    except re.error:
+        raise ToolError("Invalid regular expression.") from None
 
     inventory = list_files(root)
     matches = []
@@ -256,28 +276,31 @@ def search_code(
     for relative_path in inventory["files"]:
         target = _safe_file(root, relative_path)
 
-        if target.stat().st_size > MAX_FILE_BYTES:
-            continue
-
         try:
-            lines = redact_content(
-    target.read_text(encoding="utf-8")
-).splitlines()
+            if target.stat().st_size > MAX_FILE_BYTES:
+                continue
+
+            content = target.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
 
-        for number, line in enumerate(lines, start=1):
-            if expression.search(line):
-                if len(matches) >= limit:
-                    truncated = True
-                    break
+        lines = redact_content(content).splitlines()
 
-                # Do not return long lines that might contain credentials.
-                matches.append({
+        for number, line in enumerate(lines, start=1):
+            if not expression.search(line):
+                continue
+
+            if len(matches) >= limit:
+                truncated = True
+                break
+
+            matches.append(
+                {
                     "file": relative_path,
                     "line": number,
                     "text": line[:300],
-                })
+                }
+            )
 
         if truncated:
             break
@@ -304,7 +327,8 @@ def git_log(
 
     command = [
         "git",
-        "-C", str(root),
+        "-C",
+        str(root),
         "log",
         f"-n{limit}",
         "--format=%h%x09%cs%x09%s",
@@ -318,8 +342,12 @@ def git_log(
             timeout=10,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ToolError(f"Git log failed: {exc}") from None
+    except subprocess.TimeoutExpired:
+        raise ToolError("Git log timed out.") from None
+    except OSError as exc:
+        raise ToolError(
+            f"Git log could not start ({type(exc).__name__})."
+        ) from None
 
     if result.returncode != 0:
         raise ToolError(
@@ -330,12 +358,15 @@ def git_log(
 
     for line in result.stdout.splitlines():
         parts = line.split("\t", 2)
+
         if len(parts) == 3:
-            commits.append({
-                "hash": parts[0],
-                "date": parts[1],
-                "subject": parts[2][:300],
-            })
+            commits.append(
+                {
+                    "hash": parts[0],
+                    "date": parts[1],
+                    "subject": redact_content(parts[2])[:300],
+                }
+            )
 
     return {
         "commits": commits,
