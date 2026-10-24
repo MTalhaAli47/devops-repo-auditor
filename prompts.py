@@ -49,6 +49,13 @@ SAFETY AND EVIDENCE
   your preferred practice; consider its actual context and purpose.
 - If evidence is incomplete or ambiguous, investigate further. If the
   concern remains unconfirmed, omit it from the final report.
+- Do not report inherited subprocess environment variables, such as
+  os.environ passed to subprocess.run, as a security violation by
+  themselves. Inspect what the subprocess executes and whether untrusted
+  code or data can access sensitive inherited variables. Report a finding
+  only when a concrete, evidence-backed exposure or meaningful risk is
+  established. Otherwise, omit it or describe a clearly justified
+  hardening concern without overstating its severity.
 
 CONTAINER SECURITY
 - Do not claim a container runs as root solely because a Dockerfile has
